@@ -13,6 +13,13 @@ import wave
 import aiohttp
 from aiohttp import web
 
+from .bailian_config import (
+    BAILIAN_PROVIDER,
+    BAILIAN_TTS_API_URL,
+    BAILIAN_TTS_MODEL,
+    load_bailian_speech_api_key,
+)
+
 # TTS parameters
 TTS_URL = os.getenv("TTS_URL", "ws://127.0.0.1:8992/ws/tts")
 TTS_SAMPLE_RATE = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
@@ -39,6 +46,9 @@ TTS_TRUST_ENV = os.getenv("TTS_TRUST_ENV", "1").lower() not in {
     "false",
     "no",
 }
+BAILIAN_TTS_VOICE = os.getenv("BAILIAN_TTS_VOICE", "longanhuan_v3.6")
+BAILIAN_TTS_HTTP_TIMEOUT = float(os.getenv("BAILIAN_TTS_HTTP_TIMEOUT", "90"))
+BAILIAN_TTS_FORWARD_CHUNK_SIZE = int(os.getenv("BAILIAN_TTS_FORWARD_CHUNK_SIZE", "8192"))
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +250,11 @@ async def synthesize_tts_wav(text: str, **kwargs) -> tuple[bytes, int]:
     return pcm16_to_wav_bytes(pcm, sample_rate), len(pcm)
 
 
-async def run_tts_stream_request(client_ws, data):
+async def run_tts_stream_request(client_ws, data, provider=None):
+    if provider == BAILIAN_PROVIDER:
+        await run_bailian_tts_stream_request(client_ws, data)
+        return
+
     upstream_session = None
     upstream_ws = None
     reqid = data.get("request_id") or data.get("reqid")
@@ -358,7 +372,11 @@ async def tts_websocket_handler(request):
                 message_type = data.get("type") or "speak"
                 if message_type == "speak":
                     await cancel_tts_stream_task(stream_task)
-                    stream_task = asyncio.create_task(run_tts_stream_request(client_ws, data))
+                    stream_task = asyncio.create_task(
+                        run_tts_stream_request(
+                            client_ws, data, request.app.get("voice_provider")
+                        )
+                    )
                 elif message_type == "stop":
                     await cancel_tts_stream_task(stream_task)
                     stream_task = None
@@ -381,6 +399,16 @@ async def tts_websocket_handler(request):
 
 
 async def tts_config_handler(request):
+    if request.app.get("voice_provider") == BAILIAN_PROVIDER:
+        return web.json_response(
+            {
+                "provider": BAILIAN_PROVIDER,
+                "model": BAILIAN_TTS_MODEL,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "voice": BAILIAN_TTS_VOICE,
+                "max_text_chars": TTS_MAX_TEXT_CHARS,
+            }
+        )
     return web.json_response(
         {
             "url": TTS_URL,
@@ -396,3 +424,79 @@ async def tts_config_handler(request):
 def setup_tts_routes(app):
     app.router.add_get("/api/tts/config", tts_config_handler)
     app.router.add_get("/api/tts", tts_websocket_handler)
+
+
+def wav_to_pcm16(wav_data: bytes) -> tuple[bytes, int]:
+    """Convert the cloud WAV result into the PCM16 protocol already used by the UI."""
+    with wave.open(io.BytesIO(wav_data), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        if channels != 1 or sample_width != 2:
+            raise ValueError("Bailian TTS returned an unsupported WAV format")
+        return wav_file.readframes(wav_file.getnframes()), sample_rate
+
+
+def build_bailian_tts_payload(text: str, voice: str = BAILIAN_TTS_VOICE) -> dict:
+    return {
+        "model": BAILIAN_TTS_MODEL,
+        "input": {
+            "text": text,
+            "voice": voice,
+            "format": "wav",
+            "sample_rate": TTS_SAMPLE_RATE,
+        },
+    }
+
+
+async def synthesize_bailian_tts_pcm(text: str, voice: str = BAILIAN_TTS_VOICE) -> tuple[bytes, int]:
+    """Call Qwen TTS and return mono PCM16 suitable for the current browser player."""
+    text = normalize_tts_text(text)
+    if not text:
+        raise ValueError("text must not be empty")
+
+    timeout = aiohttp.ClientTimeout(total=BAILIAN_TTS_HTTP_TIMEOUT)
+    headers = {
+        "Authorization": f"Bearer {load_bailian_speech_api_key()}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=TTS_TRUST_ENV) as session:
+        async with session.post(BAILIAN_TTS_API_URL, headers=headers, json=build_bailian_tts_payload(text, voice)) as response:
+            if response.status >= 400:
+                raise RuntimeError("Bailian TTS request was rejected")
+            payload = await response.json(content_type=None)
+        audio_url = ((payload.get("output") or {}).get("audio") or {}).get("url")
+        if not isinstance(audio_url, str) or not audio_url:
+            raise RuntimeError("Bailian TTS returned no audio URL")
+        async with session.get(audio_url) as audio_response:
+            if audio_response.status >= 400:
+                raise RuntimeError("Bailian TTS audio download failed")
+            wav_data = await audio_response.read()
+    return wav_to_pcm16(wav_data)
+
+
+async def run_bailian_tts_stream_request(client_ws, data):
+    """Keep the existing browser WebSocket contract while using HTTP cloud TTS."""
+    reqid = data.get("request_id") or data.get("reqid") or uuid.uuid4().hex
+    try:
+        text = normalize_tts_text(data.get("text", ""))
+        if not text:
+            await client_ws.send_json({"type": "error", "request_id": reqid, "error": "Missing text"})
+            return
+        voice = data.get("voice") or BAILIAN_TTS_VOICE
+        pcm, sample_rate = await synthesize_bailian_tts_pcm(text, voice)
+        await client_ws.send_json(
+            {"type": "start", "request_id": reqid, "format": "pcm16", "sample_rate": sample_rate, "channels": 1, "reqid": reqid}
+        )
+        for offset in range(0, len(pcm), BAILIAN_TTS_FORWARD_CHUNK_SIZE):
+            await client_ws.send_bytes(pcm[offset : offset + BAILIAN_TTS_FORWARD_CHUNK_SIZE])
+        await client_ws.send_json({"type": "done", "request_id": reqid, "reqid": reqid, "audio_bytes": len(pcm)})
+    except asyncio.CancelledError:
+        raise
+    except ValueError as err:
+        await client_ws.send_json({"type": "error", "request_id": reqid, "error": str(err)})
+    except Exception:
+        logger.warning("[tts] Bailian TTS request failed reqid=%s", reqid)
+        await client_ws.send_json(
+            {"type": "error", "request_id": reqid, "error": "Bailian TTS request failed. Check the service configuration."}
+        )

@@ -1249,6 +1249,9 @@ async def create_app(test_mode=False):
     """
     # Create web application
     app = web.Application()
+    # ASR/TTS handlers use this to choose the cloud implementation without
+    # affecting the optional legacy local services.
+    app["voice_provider"] = default_vlm_config.get("provider") or resolve_provider()
     app.router.add_get("/", index)
     app.router.add_get("/models", models)
     app.router.add_get("/detect-services", detect_services)

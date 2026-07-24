@@ -2,15 +2,24 @@
 """ASR websocket bridge for browser microphone audio."""
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
 import struct
 import time
 import uuid
+import wave
 
 import aiohttp
 from aiohttp import web
+from .bailian_config import (
+    BAILIAN_ASR_API_URL,
+    BAILIAN_ASR_MODEL,
+    BAILIAN_PROVIDER,
+    load_bailian_speech_api_key,
+)
 
 # ASR parameters
 ASR_URL = os.getenv("ASR_URL", "ws://127.0.0.1:8994/ws/asr")
@@ -27,6 +36,10 @@ ASR_RETRY_INITIAL_DELAY = float(os.getenv("ASR_RETRY_INITIAL_DELAY", "0.5"))
 ASR_RETRY_MAX_DELAY = float(os.getenv("ASR_RETRY_MAX_DELAY", "5"))
 ASR_FINAL_TIMEOUT = float(os.getenv("ASR_FINAL_TIMEOUT", "8.0"))
 ASR_FINAL_GRACE_SECONDS = float(os.getenv("ASR_FINAL_GRACE_SECONDS", "1.2"))
+# The cloud API accepts a complete audio file, not this project's local
+# streaming packet protocol. Keep the uploaded WAV safely below the API limit.
+BAILIAN_ASR_MAX_PCM_BYTES = int(os.getenv("BAILIAN_ASR_MAX_PCM_BYTES", str(6 * 1024 * 1024)))
+BAILIAN_ASR_FINAL_TIMEOUT = float(os.getenv("BAILIAN_ASR_FINAL_TIMEOUT", "45"))
 ASR_RECOGNIZE_PARAMS = {
     "do_post_process": True,
     "do_partial_result": True,
@@ -46,14 +59,6 @@ ASR_RECOGNIZE_PARAMS = {
 ASR_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 logger = logging.getLogger(__name__)
-
-
-def mask_secret(value):
-    if not value:
-        return ""
-    if len(value) <= 8:
-        return "***"
-    return f"{value[:4]}...{value[-4:]}"
 
 
 def build_asr_headers():
@@ -88,13 +93,7 @@ async def connect_asr(session_id):
     while True:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         try:
-            logger.info(
-                "[%s] ASR connect attempt %s url=%s authorization=%s",
-                session_id,
-                attempt + 1,
-                ASR_URL,
-                mask_secret(ASR_AUTHORIZATION),
-            )
+            logger.info("[%s] ASR connect attempt %s", session_id, attempt + 1)
             asr_ws = await session.ws_connect(
                 ASR_URL,
                 headers=build_asr_headers(),
@@ -293,6 +292,9 @@ async def forward_asr_results(
 
 
 async def asr_websocket_handler(request):
+    if request.app.get("voice_provider") == BAILIAN_PROVIDER:
+        return await bailian_asr_websocket_handler(request)
+
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
@@ -357,3 +359,132 @@ async def asr_websocket_handler(request):
 
 def setup_asr_routes(app):
     app.router.add_get("/ws/asr", asr_websocket_handler)
+
+
+def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int = ASR_SAMPLE_RATE) -> bytes:
+    """Wrap mono PCM16 browser audio in a standard WAV container."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def build_bailian_asr_payload(pcm: bytes, sample_rate: int = ASR_SAMPLE_RATE) -> dict:
+    """Build the Fun-ASR-Realtime HTTP request for a complete WAV recording."""
+    wav_data = base64.b64encode(pcm16_to_wav_bytes(pcm, sample_rate)).decode("ascii")
+    return {
+        "model": BAILIAN_ASR_MODEL,
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"audio": f"data:audio/wav;base64,{wav_data}"}],
+                }
+            ]
+        },
+        "parameters": {"format": "wav", "sample_rate": str(sample_rate)},
+        "resources": [],
+    }
+
+
+def extract_bailian_asr_text(payload: dict) -> str:
+    """Read the recognised text from supported DashScope ASR response shapes."""
+    output = payload.get("output") or {}
+    nested = output.get("output") or {}
+    sentence = nested.get("sentence") or {}
+    for value in (output.get("text"), sentence.get("text")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+async def recognize_bailian_pcm(pcm: bytes, sample_rate: int = ASR_SAMPLE_RATE) -> str:
+    """Send one completed browser recording to Qwen ASR."""
+    if not pcm:
+        raise ValueError("No microphone audio was received")
+    if len(pcm) > BAILIAN_ASR_MAX_PCM_BYTES:
+        raise ValueError("The recording is too long; please record a shorter message")
+
+    headers = {
+        "Authorization": f"Bearer {load_bailian_speech_api_key()}",
+        "Content-Type": "application/json",
+        "X-DashScope-SSE": "disable",
+    }
+    timeout = aiohttp.ClientTimeout(total=BAILIAN_ASR_FINAL_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            BAILIAN_ASR_API_URL,
+            headers=headers,
+            json=build_bailian_asr_payload(pcm, sample_rate),
+        ) as response:
+            if response.status >= 400:
+                raise RuntimeError("Bailian ASR request was rejected")
+            payload = await response.json(content_type=None)
+    text = extract_bailian_asr_text(payload)
+    if not text:
+        raise RuntimeError("Bailian ASR returned no recognised text")
+    return text
+
+
+async def bailian_asr_websocket_handler(request):
+    """Browser microphone bridge for the non-realtime Bailian ASR model."""
+    ws = web.WebSocketResponse(max_msg_size=0)
+    await ws.prepare(request)
+    audio = bytearray()
+    session_id = request.query.get("session_id", "").strip() or uuid.uuid4().hex[:8]
+
+    try:
+        await send_asr_client_json(
+            ws,
+            {
+                "type": "status",
+                "message": "connected",
+                "sample_rate": ASR_SAMPLE_RATE,
+                "final_timeout_ms": int(BAILIAN_ASR_FINAL_TIMEOUT * 1000),
+            },
+        )
+        async for msg in ws:
+            if msg.type == web.WSMsgType.BINARY:
+                if len(audio) + len(msg.data) > BAILIAN_ASR_MAX_PCM_BYTES:
+                    raise ValueError("The recording is too long; please record a shorter message")
+                audio.extend(msg.data)
+            elif msg.type == web.WSMsgType.TEXT:
+                try:
+                    control = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                if control.get("type") == "ping":
+                    await send_asr_client_json(ws, {"type": "pong", "id": control.get("id")})
+                elif control.get("type") in {"end", "segment_end"}:
+                    text = await recognize_bailian_pcm(bytes(audio))
+                    await send_asr_client_json(
+                        ws,
+                        {
+                            "type": "result",
+                            "event": "IS_FINAL",
+                            "mid": "",
+                            "text": text,
+                            "confidence": None,
+                            "final": True,
+                            "code": 0,
+                            "msg": "",
+                        },
+                    )
+                    return ws
+            elif msg.type == web.WSMsgType.ERROR:
+                raise ws.exception() or RuntimeError("ASR client websocket error")
+    except ValueError as err:
+        await send_asr_client_json(ws, {"type": "error", "message": str(err)})
+    except Exception:
+        logger.warning("[%s] Bailian ASR request failed", session_id)
+        await send_asr_client_json(
+            ws,
+            {"type": "error", "message": "Bailian ASR request failed. Check the service configuration."},
+        )
+    finally:
+        if not ws.closed:
+            await ws.close()
+    return ws

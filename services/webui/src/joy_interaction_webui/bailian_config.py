@@ -8,6 +8,16 @@ from pathlib import Path
 
 BAILIAN_API_BASE = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 BAILIAN_MODEL = "qwen3.7-plus"
+BAILIAN_ASR_MODEL = "fun-asr-realtime"
+BAILIAN_TTS_MODEL = "qwen-audio-3.0-tts-plus"
+BAILIAN_ASR_API_URL = os.getenv(
+    "BAILIAN_ASR_API_URL",
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+)
+BAILIAN_TTS_API_URL = os.getenv(
+    "BAILIAN_TTS_API_URL",
+    "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+)
 BAILIAN_MODELS = (
     "qwen3.7-plus",
     "qwen3.6-plus",
@@ -71,3 +81,21 @@ def load_bailian_api_key(
     raise BailianConfigurationError(
         "Bailian API key file does not contain a valid key line starting with 'sk-'."
     )
+
+
+def load_bailian_speech_api_key(
+    *,
+    key_file: Path = API_KEY_FILE,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Load an optional DashScope speech key, with the visual key as fallback.
+
+    Token Plan credentials can be scoped to the visual compatible endpoint.
+    A regular Model Studio/DashScope key can therefore be supplied separately
+    through ``DASHSCOPE_API_KEY`` without moving any secret into the repository.
+    """
+    env = os.environ if environ is None else environ
+    speech_key = env.get("DASHSCOPE_API_KEY", "").strip()
+    if speech_key:
+        return speech_key
+    return load_bailian_api_key(key_file=key_file, environ=env)

@@ -3917,7 +3917,7 @@ limitations under the License.
         const ASR_SILENCE_AUTO_STOP_MS = 2000;
         const ASR_SILENCE_RMS_THRESHOLD = 0.012;
         const ASR_AUDIO_BUFFER_SIZE = 4096;
-        const ASR_FINAL_FALLBACK_MS = 1200;
+        let asrFinalFallbackMs = 1200;
         const ASR_WS_PATH = '/ws/asr';
 
         // Elements
@@ -7527,6 +7527,9 @@ limitations under the License.
             asrWs.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 if (data.type === 'status' && data.message === 'connected') {
+                    if (Number.isFinite(Number(data.final_timeout_ms))) {
+                        asrFinalFallbackMs = Number(data.final_timeout_ms) + 1500;
+                    }
                     if (!isAnalysisRunning) {
                         stopSpeech({ sendEnd: false, sendPrompt: false });
                         return;
@@ -7630,7 +7633,7 @@ limitations under the License.
                             sendPrompt: Boolean(promptText.value.trim())
                         });
                     }
-                }, ASR_FINAL_FALLBACK_MS);
+                }, asrFinalFallbackMs);
             }
 
             if (asrProcessor) {
